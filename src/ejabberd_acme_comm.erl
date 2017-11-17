@@ -141,7 +141,7 @@ revoke_cert(Dirs, PrivateKey, Req, Nonce) ->
     prepare_post_request(Url, PrivateKey, EJson, Nonce, fun get_response/1,
                          "application/pkix-cert").
 
--spec get_cert({url(), string()}) -> {ok, list(), nonce()} | {error, _}.
+-spec get_issuer_cert({url(), string()}) -> {ok, list(), nonce()} | {error, _}.
 get_issuer_cert(IssuerCertUrl) ->
     prepare_get_request(IssuerCertUrl, fun get_response/1, "application/pkix-cert").
     

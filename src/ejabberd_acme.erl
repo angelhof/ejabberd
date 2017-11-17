@@ -1,39 +1,70 @@
 -module (ejabberd_acme).
+-behaviour(gen_server).
+-behavior(ejabberd_config).
 
--export([%% Ejabberdctl Commands
-	 get_certificates/1,
+%% ejabberdctl commands
+-export([get_certificates/1,
 	 renew_certificates/0,
 	 list_certificates/1,
-	 revoke_certificate/1,
-	 %% Command Options Validity
-	 is_valid_account_opt/1,
+	 revoke_certificate/1]).
+%% Command Options Validity
+-export([is_valid_account_opt/1,
 	 is_valid_verbose_opt/1,
 	 is_valid_domain_opt/1,
-	 is_valid_revoke_cert/1,
-	 %% Called by ejabberd_pkix
-	 certificate_exists/1,
-	 %% Key Related
-	 generate_key/0,
-	 to_public/1
-	]).
+	 is_valid_revoke_cert/1]).
+%% Key Related
+-export([generate_key/0, to_public/1]).
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+	 terminate/2, code_change/3]).
+-export([start_link/0, opt_type/1]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
 -include("xmpp.hrl").
-
+-include("ejabberd_commands.hrl").
 -include("ejabberd_acme.hrl").
 -include_lib("public_key/include/public_key.hrl").
 
--export([opt_type/1]).
-
--behavior(ejabberd_config).
-
-%%
-%% Default ACME configuration
-%%
-
 -define(DEFAULT_CONFIG_CONTACT, <<"mailto:example-admin@example.com">>).
 -define(DEFAULT_CONFIG_CA_URL, "https://acme-v01.api.letsencrypt.org").
+
+-record(state, {}).
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+%%%===================================================================
+%%% gen_server callbacks
+%%%===================================================================
+init([]) ->
+    case filelib:ensure_dir(filename:join(acme_certs_dir(), "foo")) of
+	ok ->
+	    ejabberd_commands:register_commands(get_commands_spec()),
+	    register_certfiles(),
+	    {ok, #state{}};
+	{error, Why} ->
+	    ?CRITICAL_MSG("Failed to create directory ~s: ~s",
+			  [acme_certs_dir(), file:format_error(Why)]),
+	    {stop, Why}
+    end.
+
+handle_call(_Request, _From, State) ->
+    {stop, {unexpected_call, _Request, _From}, State}.
+
+handle_cast(_Msg, State) ->
+    ?WARNING_MSG("unexpected cast: ~p", [_Msg]),
+    {noreply, State}.
+
+handle_info(_Info, State) ->
+    ?WARNING_MSG("unexpected info: ~p", [_Info]),
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ejabberd_commands:unregister_commands(get_commands_spec()).
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%
@@ -71,23 +102,58 @@ is_valid_revoke_cert(DomainOrFile) ->
     lists:prefix("file:", DomainOrFile) orelse
 	lists:prefix("domain:", DomainOrFile).
 	    
-
+%% Commands
+get_commands_spec() ->
+    [#ejabberd_commands{name = get_certificates, tags = [acme],
+			desc = "Gets certificates for all or the specified "
+			       "domains {all|domain1;domain2;...}.",
+			module = ?MODULE, function = get_certificates,
+			args_desc = ["Domains for which to acquire a certificate"],
+			args_example = ["all | www.example.com;www.example1.net"],
+			args = [{domains, string}],
+			result = {certificates, string}},
+     #ejabberd_commands{name = renew_certificate, tags = [acme],
+			desc = "Renews all certificates that are close to expiring",
+			module = ?MODULE, function = renew_certificate,
+			args = [],
+			result = {certificates, string}},
+     #ejabberd_commands{name = list_certificates, tags = [acme],
+			desc = "Lists all curently handled certificates and "
+			       "their respective domains in {plain|verbose} format",
+			module = ?MODULE, function = list_certificates,
+			args_desc = ["Whether to print the whole certificate "
+				     "or just some metadata. "
+				     "Possible values: plain | verbose"],
+			args = [{option, string}],
+			result = {certificates, {list, {certificate, string}}}},
+     #ejabberd_commands{name = revoke_certificate, tags = [acme],
+			desc = "Revokes the selected certificate",
+			module = ?MODULE, function = revoke_certificate,
+			args_desc = ["The domain or file (in pem format) of "
+				     "the certificate in question "
+				     "{domain:Domain | file:File}"],
+			args = [{domain_or_file, string}],
+			result = {res, restuple}}].
 
 %%
 %% Get Certificate
 %%
-
 -spec get_certificates(domains_opt()) -> string() | {'error', _}.
 get_certificates(Domains) ->
-    try
-	CAUrl = get_config_ca_url(),
-	get_certificates0(CAUrl, Domains)
-    catch
-	throw:Throw ->
-	    Throw;
-	E:R ->
-	    ?ERROR_MSG("Unknown ~p:~p, ~p", [E, R, erlang:get_stacktrace()]), 
-	    {error, get_certificates}
+    case is_valid_domain_opt(Domains) of 
+	true ->
+	    try
+		CAUrl = get_config_ca_url(),
+		get_certificates0(CAUrl, Domains)
+	    catch
+		throw:Throw ->
+		    Throw;
+		E:R ->
+		    ?ERROR_MSG("Unknown ~p:~p, ~p", [E, R, erlang:get_stacktrace()]), 
+		    {error, get_certificates}
+	    end;
+	false ->
+	    io_lib:format("Invalid domains: ~p", [Domains])
     end.
 
 -spec get_certificates0(url(), domains_opt()) -> string().
@@ -371,14 +437,20 @@ close_to_expire(Validity, Days) ->
 %%
 -spec list_certificates(verbose_opt()) -> [string()] | [any()] | {error, _}.
 list_certificates(Verbose) ->
-    try
-	list_certificates0(Verbose)
-    catch
-	throw:Throw ->
-	    Throw;
-	E:R ->
-	    ?ERROR_MSG("Unknown ~p:~p, ~p", [E, R, erlang:get_stacktrace()]), 
-	    {error, list_certificates}
+    case is_valid_verbose_opt(Verbose) of
+	true ->
+	    try
+		list_certificates0(Verbose)
+	    catch
+		throw:Throw ->
+		    Throw;
+		E:R ->
+		    ?ERROR_MSG("Unknown ~p:~p, ~p", [E, R, erlang:get_stacktrace()]), 
+		    {error, list_certificates}
+	    end;
+	false ->
+	    String = io_lib:format("Invalid verbose  option: ~p", [Verbose]),
+	    {invalid_option, String}
     end.
 
 -spec list_certificates0(verbose_opt()) -> [string()] | [any()].
@@ -522,8 +594,17 @@ get_utc_validity(#'Certificate'{tbsCertificate = TbsCertificate}) ->
 %% Revoke Certificate
 %%
 
--spec revoke_certificate(string()) -> {ok, deleted} | {error, _}.
 revoke_certificate(DomainOrFile) ->
+    case is_valid_revoke_cert(DomainOrFile) of
+	true ->
+	    revoke_certificates(DomainOrFile);
+	false ->
+	    String = io_lib:format("Bad argument: ~s", [DomainOrFile]),
+	    {invalid_argument, String}
+    end.
+
+-spec revoke_certificates(string()) -> {ok, deleted} | {error, _}.
+revoke_certificates(DomainOrFile) ->
     try
 	CAUrl = get_config_ca_url(),
 	revoke_certificate0(CAUrl, DomainOrFile)
@@ -594,26 +675,6 @@ prepare_certificate_revoke(PemEncodedCert) ->
 domain_certificate_exists(Domain) ->
     Certs = read_certificates_persistent(),
     lists:keyfind(Domain, 1, Certs).
-
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%
-%% Called by ejabberd_pkix to check
-%% if a certificate exists for a 
-%% specific host
-%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
--spec certificate_exists(bitstring()) -> {true, file:filename()} | false.
-certificate_exists(Host) ->
-    Certificates = read_certificates_persistent(),
-    case lists:keyfind(Host, 1 , Certificates) of
-	false ->
-	    false;
-	{Host, #data_cert{path=Path}} ->
-	    {true, Path}
-    end.
-
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%
@@ -955,8 +1016,8 @@ data_remove_certificate(Data, _DataCert = #data_cert{domain=Domain}) ->
 
 -spec persistent_file() -> file:filename().
 persistent_file() ->
-    MnesiaDir = mnesia:system_info(directory),
-    filename:join(MnesiaDir, "acme.DAT").
+    AcmeDir = acme_certs_dir(),
+    filename:join(AcmeDir, "acme.DAT").
 
 %% The persistent file should be read and written only by its owner
 -spec persistent_file_mode() -> 384.
@@ -1036,9 +1097,9 @@ save_certificate({error, _, _} = Error) ->
     Error;
 save_certificate({ok, DomainName, Cert}) ->
     try
-        CertDir = get_config_cert_dir(),
+        CertDir = acme_certs_dir(),
 	DomainString = bitstring_to_list(DomainName),
-	CertificateFile = filename:join([CertDir, DomainString ++ "_cert.pem"]),
+	CertificateFile = filename:join([CertDir, DomainString ++ ".pem"]),
 	%% TODO: At some point do the following using a Transaction so
 	%% that there is no certificate saved if it cannot be added in
 	%% certificate persistent storage
@@ -1049,7 +1110,7 @@ save_certificate({ok, DomainName, Cert}) ->
 		      path = CertificateFile
 		     },
 	add_certificate_persistent(DataCert),
-	ejabberd_pkix:add_certfile(CertificateFile),
+	ok = ejabberd_pkix:add_certfile(CertificateFile),
 	{ok, DomainName, saved}
     catch
 	throw:Throw ->
@@ -1067,6 +1128,15 @@ save_renewed_certificate({ok, _, no_expire} = Cert) ->
     Cert;
 save_renewed_certificate({ok, DomainName, Cert}) ->
     save_certificate({ok, DomainName, Cert}).
+
+-spec register_certfiles() -> ok.
+register_certfiles() ->
+    Dir = acme_certs_dir(),
+    Paths = filelib:wildcard(filename:join(Dir, "*.pem")),
+    lists:foreach(
+      fun(Path) ->
+	      ejabberd_pkix:add_certfile(Path)
+      end, Paths).
 
 -spec write_cert(file:filename(), binary(), bitstring()) -> {ok, bitstring(), saved}.
 write_cert(CertificateFile, Cert, DomainName) ->
@@ -1125,17 +1195,9 @@ get_config_hosts() ->
 	    Hosts
     end.
 
--spec get_config_cert_dir() -> file:filename().
-get_config_cert_dir() ->
-    case ejabberd_config:get_option(cert_dir, undefined) of
-	undefined ->
-	    ?WARNING_MSG("No cert_dir configuration has been specified in configuration", []),
-	    mnesia:system_info(directory);
-	    %% throw({error, configuration});
-        CertDir ->
-	    CertDir
-    end.
-
+-spec acme_certs_dir() -> file:filename().
+acme_certs_dir() ->
+    filename:join(ejabberd_pkix:certs_dir(), "acme").
 
 generate_key() ->
     jose_jwk:generate_key({ec, secp256r1}).
@@ -1145,26 +1207,20 @@ generate_key() ->
 %% Option Parsing Code
 %%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
-parse_acme_opts(AcmeOpt) ->
-    [parse_acme_opt(Opt) || Opt <- AcmeOpt].
-
-
-parse_acme_opt({ca_url, CaUrl}) when is_bitstring(CaUrl) ->
-    {ca_url, binary_to_list(CaUrl)};
-parse_acme_opt({contact, Contact}) when is_bitstring(Contact) ->
-    {contact, Contact}.
-
-parse_cert_dir_opt(Opt) when is_bitstring(Opt) ->
-    true = filelib:is_dir(Opt),
-    Opt.
-
 -spec opt_type(acme) -> fun((acme_config()) -> (acme_config()));
-	      (cert_dir) -> fun((bitstring()) -> (bitstring()));
 	      (atom()) -> [atom()].
 opt_type(acme) ->
-    fun parse_acme_opts/1;
-opt_type(cert_dir) ->
-    fun parse_cert_dir_opt/1;
+    fun(L) ->
+	    lists:map(
+	      fun({ca_url, URL}) ->
+		      URL1 = binary_to_list(URL),
+		      {ok, _} = http_uri:parse(URL1),
+		      URL1;
+		 ({contact, Contact}) ->
+		      [<<_, _/binary>>, <<_, _/binary>>] =
+			  binary:split(Contact, <<":">>),
+		      Contact
+	      end, L)
+    end;
 opt_type(_) ->
-    [acme, cert_dir].
+    [acme].
