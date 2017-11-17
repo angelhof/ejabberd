@@ -331,8 +331,12 @@ create_new_certificate(CAUrl, {DomainName, AllSubDomains}, PrivateKey) ->
 	     {<<"notBefore">>, NotBefore},
 	     {<<"NotAfter">>, NotAfter}
 	    ],
-	{ok, {_CertUrl, Certificate}, _Nonce1} = 
+	{ok, {IssuerCertLink, Certificate}, _Nonce1} = 
 	    ejabberd_acme_comm:new_cert(Dirs, PrivateKey, Req, Nonce0),
+
+	{ok, IssuerCert, _Nonce2} = ejabberd_acme_comm:get_issuer_cert(IssuerCertLink),
+	DecodedIssuerCert = public_key:pkix_decode_cert(list_to_binary(IssuerCert), plain),	
+	PemEntryIssuerCert = public_key:pem_entry_encode('Certificate', DecodedIssuerCert),
 
 	DecodedCert = public_key:pkix_decode_cert(list_to_binary(Certificate), plain),	
 	PemEntryCert = public_key:pem_entry_encode('Certificate', DecodedCert),
@@ -340,7 +344,7 @@ create_new_certificate(CAUrl, {DomainName, AllSubDomains}, PrivateKey) ->
 	{_, CSRKeyKey} = jose_jwk:to_key(CSRKey),
 	PemEntryKey = public_key:pem_entry_encode('ECPrivateKey', CSRKeyKey),
 
-	PemCertKey = public_key:pem_encode([PemEntryKey, PemEntryCert]),
+	PemCertKey = public_key:pem_encode([PemEntryKey, PemEntryCert, PemEntryIssuerCert]),
 
 	{ok, DomainName, PemCertKey}
     catch		     
@@ -1100,13 +1104,13 @@ save_certificate({ok, DomainName, Cert}) ->
 	%% that there is no certificate saved if it cannot be added in
 	%% certificate persistent storage
 	write_cert(CertificateFile, Cert, DomainName),
+	ok = ejabberd_pkix:add_certfile(CertificateFile),
 	DataCert = #data_cert{
 		      domain = DomainName,
 		      pem = Cert,
 		      path = CertificateFile
 		     },
 	add_certificate_persistent(DataCert),
-	ok = ejabberd_pkix:add_certfile(CertificateFile),
 	{ok, DomainName, saved}
     catch
 	throw:Throw ->
@@ -1175,7 +1179,7 @@ get_config_ca_url() ->
 	{ca_url, CAUrl} ->
 	    CAUrl;
 	false ->
-	    ?ERROR_MSG("No CA url has been specified in configuration", []),
+	    ?WARNING_MSG("No CA url has been specified in configuration", []),
 	    ?DEFAULT_CONFIG_CA_URL
 	    %% throw({error, configuration_ca_url})
     end.
@@ -1211,11 +1215,11 @@ opt_type(acme) ->
 	      fun({ca_url, URL}) ->
 		      URL1 = binary_to_list(URL),
 		      {ok, _} = http_uri:parse(URL1),
-		      URL1;
+		      {ca_url, URL1};
 		 ({contact, Contact}) ->
 		      [<<_, _/binary>>, <<_, _/binary>>] =
 			  binary:split(Contact, <<":">>),
-		      Contact
+		      {contact, Contact}
 	      end, L)
     end;
 opt_type(_) ->
