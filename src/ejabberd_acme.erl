@@ -265,8 +265,12 @@ create_new_certificate(CAUrl, {DomainName, AllSubDomains}, PrivateKey) ->
 	     {<<"notBefore">>, NotBefore},
 	     {<<"NotAfter">>, NotAfter}
 	    ],
-	{ok, {_CertUrl, Certificate}, _Nonce1} = 
+	{ok, {IssuerCertLink, Certificate}, _Nonce1} = 
 	    ejabberd_acme_comm:new_cert(Dirs, PrivateKey, Req, Nonce0),
+
+	{ok, IssuerCert, _Nonce2} = ejabberd_acme_comm:get_issuer_cert(IssuerCertLink),
+	DecodedIssuerCert = public_key:pkix_decode_cert(list_to_binary(IssuerCert), plain),	
+	PemEntryIssuerCert = public_key:pem_entry_encode('Certificate', DecodedIssuerCert),
 
 	DecodedCert = public_key:pkix_decode_cert(list_to_binary(Certificate), plain),	
 	PemEntryCert = public_key:pem_entry_encode('Certificate', DecodedCert),
@@ -274,7 +278,7 @@ create_new_certificate(CAUrl, {DomainName, AllSubDomains}, PrivateKey) ->
 	{_, CSRKeyKey} = jose_jwk:to_key(CSRKey),
 	PemEntryKey = public_key:pem_entry_encode('ECPrivateKey', CSRKeyKey),
 
-	PemCertKey = public_key:pem_encode([PemEntryKey, PemEntryCert]),
+	PemCertKey = public_key:pem_encode([PemEntryKey, PemEntryCert, PemEntryIssuerCert]),
 
 	{ok, DomainName, PemCertKey}
     catch		     
